@@ -1,0 +1,38 @@
+{
+  "name": "node-dockerfiler",
+  "type": "module",
+  "version": "0.0.1",
+  "description": "Node.js library to run Dockerfiles easily",
+  "main": "lib/index.js",
+  "scripts": {
+    "test": "c8 --reporter lcov --reporter html --reporter text --all mocha",
+    "eslint": "eslint ."
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/k13-engineering/node-dockerfiler.git"
+  },
+  "keywords": [
+    "architecture",
+    "test",
+    "docker"
+  ],
+  "author": "Simon Kadisch",
+  "license": "LGPL 2.1",
+  "bugs": {
+    "url": "https://github.com/k13-engineering/node-dockerfiler/issues"
+  },
+  "homepage": "https://github.com/k13-engineering/node-dockerfiler#readme",
+  "dependencies": {
+    "dockerode": "^3.2.1",
+    "tar-fs": "^2.1.0"
+  },
+  "devDependencies": {
+    "@babel/core": "^7.12.3",
+    "@babel/eslint-parser": "^7.12.1",
+    "@babel/plugin-syntax-top-level-await": "^7.12.1",
+    "c8": "^7.3.0",
+    "eslint": "^7.9.0",
+    "mocha": "^8.1.3"
+  }
+}
