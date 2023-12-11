@@ -5,7 +5,7 @@
   "description": "Node.js library to run Dockerfiles easily",
   "main": "lib/index.js",
   "scripts": {
-    "test": "c8 --reporter lcov --reporter html --reporter text --all mocha",
+    "test": "c8 --reporter lcov --reporter html --reporter text --all --include lib/ mocha",
     "eslint": "eslint ."
   },
   "repository": {
