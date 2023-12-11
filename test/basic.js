@@ -7,12 +7,13 @@ import assert from "assert";
 import path from "path";
 import stream from "stream";
 import url from "url";
+import tarStream from "tar-stream";
 
 const scriptPath = url.fileURLToPath(import.meta.url);
 const dirnameOfScript = path.dirname(scriptPath);
 
 const dummySink = new stream.Writable({
-  write () {}
+  write () { }
 });
 
 describe("node-dockerfiler", function () {
@@ -85,5 +86,44 @@ describe("node-dockerfiler", function () {
       "logSink": dummySink
     });
     assert.equal(result.StatusCode, 1);
+  });
+
+  it("should export images correctly", async () => {
+    const dockerfileContent = `
+      FROM debian:buster AS stage1
+      RUN echo hello > /hello.txt
+
+      FROM scratch
+      COPY --from=stage1 /hello.txt /hello.txt
+    `;
+
+    const imageAsTar = dockerfiler.exportImage({
+      dockerfileContent,
+      "context": path.resolve(dirnameOfScript, "context"),
+      "ignore": () => {
+        return true;
+      },
+      "logSink": dummySink
+    });
+
+    const extractor = tarStream.extract();
+
+    let fileList = [];
+
+    extractor.on("entry", (header, entryStream, next) => {
+      fileList = [
+        ...fileList,
+        header.name
+      ];
+      next();
+    });
+
+    await stream.promises.pipeline([
+      imageAsTar,
+      extractor
+    ]);
+
+    const helloTxtFound = fileList.includes("hello.txt");
+    assert.ok(helloTxtFound);
   });
 });
