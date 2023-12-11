@@ -1,7 +1,7 @@
 {
   "name": "node-dockerfiler",
   "type": "module",
-  "version": "0.0.2",
+  "version": "0.0.3",
   "description": "Node.js library to run Dockerfiles easily",
   "main": "lib/index.js",
   "scripts": {
