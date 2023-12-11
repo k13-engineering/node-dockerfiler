@@ -1,12 +1,8 @@
 {
-  "parser": "@babel/eslint-parser",
   "parserOptions": {
-    "ecmaVersion": 8,
+    "ecmaVersion": 2022,
     "sourceType": "module",
-    "requireConfigFile": false,
-    "babelOptions": {
-      "plugins": ["@babel/syntax-top-level-await"]
-    }
+    "requireConfigFile": false
   },
   "env": {
     "node": true,
