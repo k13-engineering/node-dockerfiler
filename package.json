@@ -28,8 +28,13 @@
     "tar-fs": "^3.0.4"
   },
   "devDependencies": {
-    "c8": "^8.0.1",
+    "@eslint/js": "^9.7.0",
+    "@types/deep-equal": "^1.0.4",
+    "@types/node": "^20.14.11",
     "eslint": "^8.55.0",
-    "mocha": "^10.2.0"
+    "mocha": "^10.2.0",
+    "c8": "^10.1.2",
+    "deno-node": "^0.0.7",
+    "typescript-eslint": "^7.16.1"
   }
 }
