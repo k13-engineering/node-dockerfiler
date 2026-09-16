@@ -12,8 +12,16 @@ import type {
   TBuildEvent,
   TExportEvent,
   TRunOutputEvent,
-  TRunInputEvent
+  TRunInputEvent,
+  TRawBuildLogEvent,
+  TRawExportEvent,
+  TRawRunOutputEvent
 } from "./build-context.ts";
+
+import {
+  buildStreamToTar,
+  buildStreamToFileInTar
+} from "./stream-helper.ts";
 
 const createDefaultDockerBuildContext = ({
   createContextTarStream,
@@ -32,7 +40,9 @@ const createDefaultDockerBuildContext = ({
 export {
   createDefaultDockerBuildContext,
   createDockerBuildContext,
-  createContextTarStreamFromDirectory
+  createContextTarStreamFromDirectory,
+  buildStreamToTar,
+  buildStreamToFileInTar
 };
 
 export type {
@@ -41,5 +51,8 @@ export type {
   TBuildEvent,
   TExportEvent,
   TRunOutputEvent,
-  TRunInputEvent
+  TRunInputEvent,
+  TRawBuildLogEvent,
+  TRawExportEvent,
+  TRawRunOutputEvent
 };

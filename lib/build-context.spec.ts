@@ -8,9 +8,17 @@ import fs from "node:fs";
 import os from "node:os";
 import nodePath from "node:path";
 import stream from "node:stream";
+import { setImmediate } from "node:timers";
 
 import { createDockerBuildContext, createContextTarStreamFromDirectory } from "./build-context.ts";
-import type { TSpawn, TBuildEvent, TExportEvent, TRunOutputEvent } from "./build-context.ts";
+import type {
+  TSpawn,
+  TBuildEvent,
+  TExportEvent,
+  TRunOutputEvent,
+  TRawExportEvent,
+  TRawRunOutputEvent
+} from "./build-context.ts";
 
 const decoder = new TextDecoder();
 const encoder = new TextEncoder();
@@ -27,6 +35,8 @@ type TFakeProcess = {
   on: (event: string, listener: (...args: unknown[]) => void) => void;
   once: (event: string, listener: (...args: unknown[]) => void) => void;
   emit: (event: string, ...args: unknown[]) => void;
+  kill: () => boolean;
+  killCount: () => number;
 };
 
 const createFakeProcess = ({ withStdin }: { withStdin: boolean }): TFakeProcess => {
@@ -36,6 +46,8 @@ const createFakeProcess = ({ withStdin }: { withStdin: boolean }): TFakeProcess 
   const stdout = createPassThrough();
   const stderr = createPassThrough();
   const stdin = withStdin ? createPassThrough() : null;
+
+  let kills = 0;
 
   if (stdin !== null) {
     // the library pipes the build context in; nothing here consumes it
@@ -56,6 +68,16 @@ const createFakeProcess = ({ withStdin }: { withStdin: boolean }): TFakeProcess 
     },
     emit: (event, ...args) => {
       events.emit(event, ...args);
+    },
+    // like a real process, a killed one closes with no exit code
+    kill: () => {
+      kills += 1;
+      events.emit("close", null);
+
+      return true;
+    },
+    killCount: () => {
+      return kills;
     }
   };
   /* eslint-enable k13-engineering/prefer-single-object-parameters */
@@ -121,20 +143,31 @@ const createSpawnMock = ({ withStdin = true }: { withStdin?: boolean } = {}) => 
   };
 };
 
+const endedContext = () => {
+  const source = createPassThrough();
+  source.end("fake-context-tar");
+
+  return source;
+};
+
+// a context factory that hands out one specific stream, so a test can drive it
+const providing = ({ context }: { context: stream.Readable }) => {
+  return () => {
+    return context;
+  };
+};
+
 const makeContext = ({
   spawn,
-  platform = undefined
+  platform = undefined,
+  createContext = endedContext
 }: {
   spawn: TSpawn;
   platform?: string | undefined;
+  createContext?: () => stream.Readable;
 }) => {
   return createDockerBuildContext({
-    createContextTarStream: () => {
-      const source = createPassThrough();
-      source.end("fake-context-tar");
-
-      return source;
-    },
+    createContextTarStream: createContext,
     platform,
     spawn
   });
@@ -218,6 +251,33 @@ const completeRun = ({
   call.proc.stdout.end(stdout);
   call.proc.stderr.end(stderr);
   call.proc.emit("close", code);
+};
+
+// writes every block straight away, reporting whether the stream ever pushed back
+const flood = ({
+  target,
+  block,
+  blockCount
+}: {
+  target: stream.Writable;
+  block: string;
+  blockCount: number;
+}) => {
+  let backpressured = false;
+
+  Array.from({ length: blockCount }).forEach(() => {
+    if (!target.write(block)) {
+      backpressured = true;
+    }
+  });
+
+  return { backpressured };
+};
+
+const settle = () => {
+  return new Promise<void>((resolve) => {
+    setImmediate(resolve);
+  });
 };
 
 const rejectionOf = async ({ promise }: { promise: Promise<unknown> }) => {
@@ -306,6 +366,24 @@ describe("createDockerBuildContext / exportImageAsTarStream", () => {
     assert.ok(error.message.includes("exited with code 7"), error.message);
   });
 
+  it("should fail on a non-zero exit even while its stdio is still open", async () => {
+    const mock = createSpawnMock();
+    const events = collectEvents<TExportEvent>({
+      source: makeContext({ spawn: mock.spawn }).exportImageAsTarStream({ buildArgs: {} })
+    });
+
+    const call = mock.callAt({ index: 0 });
+
+    // partial output, and neither stream is ended: the exit code alone must fail the stream
+    call.proc.stderr.write(`{"id":"exporting"}\n`);
+    call.proc.stdout.write("half-a-tar");
+    call.proc.emit("close", 1);
+
+    const { error } = await rejectionOf({ promise: events });
+
+    assert.ok(error.message.includes("docker build exited with code 1"), error.message);
+  });
+
   it("should fail gracefully when the process cannot be spawned", async () => {
     const mock = createSpawnMock();
     const events = collectEvents<TExportEvent>({
@@ -347,6 +425,54 @@ describe("createDockerBuildContext / exportImageAsTarStream", () => {
     const { error } = await rejectionOf({ promise: events });
 
     assert.ok(error.message.includes("stderr exploded"), error.message);
+  });
+
+  it("should fail, not crash, when the build context stream errors", async () => {
+    const mock = createSpawnMock();
+    const context = createPassThrough();
+    const events = collectEvents<TExportEvent>({
+      source: makeContext({ spawn: mock.spawn, createContext: providing({ context }) }).exportImageAsTarStream({ buildArgs: {} })
+    });
+
+    // e.g. tar-fs hitting an unreadable directory while docker is still consuming it
+    context.destroy(Error("context directory vanished"));
+
+    const { error } = await rejectionOf({ promise: events });
+
+    assert.ok(error.message.includes("context directory vanished"), error.message);
+    assert.equal(mock.callAt({ index: 0 }).proc.killCount(), 1, "docker must be stopped");
+  });
+
+  it("should stop docker and the context when the consumer destroys the stream", async () => {
+    const mock = createSpawnMock();
+    const context = createPassThrough();
+    const output = makeContext({ spawn: mock.spawn, createContext: providing({ context }) }).exportImageAsTarStream({ buildArgs: {} });
+
+    const closed = new Promise<void>((resolve) => {
+      output.once("close", () => {
+        resolve();
+      });
+    });
+
+    output.destroy();
+    await closed;
+
+    assert.equal(mock.callAt({ index: 0 }).proc.killCount(), 1, "docker must be killed");
+    assert.ok(context.destroyed, "the context stream must be released");
+  });
+
+  it("should fail gracefully when the build log is not valid json", async () => {
+    const mock = createSpawnMock();
+    const events = collectEvents<TExportEvent>({
+      source: makeContext({ spawn: mock.spawn }).exportImageAsTarStream({ buildArgs: {} })
+    });
+
+    const call = mock.callAt({ index: 0 });
+    call.proc.stderr.end("this is not rawjson progress\n");
+
+    const { error } = await rejectionOf({ promise: events });
+
+    assert.ok(error.message.includes("Invalid JSON"), error.message);
   });
 
   it("should survive an EPIPE while writing the build context", async () => {
@@ -557,6 +683,106 @@ describe("createDockerBuildContext / runImage", () => {
     });
   });
 
+});
+
+describe("createDockerBuildContext / runImage backpressure", () => {
+
+  it("should backpressure the container output while nothing reads", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    completeBuild({ call: mock.callAt({ index: 0 }) });
+
+    await mock.waitForCall({ index: 1 });
+    const runCall = mock.callAt({ index: 1 });
+
+    // the buffers along the chain are object mode, so what matters is the chunk count
+    const block = "z".repeat(1024);
+    const blockCount = 2000;
+
+    const { backpressured } = flood({ target: runCall.proc.stdout, block, blockCount });
+
+    assert.ok(backpressured, "the container output must be backpressured");
+
+    // a reader shows up late, and still gets every byte
+    const collected = collectEvents<TRunOutputEvent>({ source: duplex });
+
+    runCall.proc.stdout.end();
+    runCall.proc.stderr.end();
+    runCall.proc.emit("close", 0);
+
+    const seen = textOf({ events: await collected, type: "stdout" });
+
+    assert.equal(seen.length, block.length * blockCount);
+  });
+
+  it("should backpressure the json build log through JSONStream while nothing reads", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    const buildCall = mock.callAt({ index: 0 });
+
+    // JSONStream is an old style through stream; this proves it still pushes back
+    const block = `{"id":"${"j".repeat(1000)}"}\n`;
+    const blockCount = 2000;
+
+    const { backpressured } = flood({ target: buildCall.proc.stderr, block, blockCount });
+
+    assert.ok(backpressured, "the json build log must be backpressured");
+
+    const collected = collectEvents<TRunOutputEvent>({ source: duplex });
+
+    writeImageId({ call: buildCall, imageId: "sha256:feedface" });
+    buildCall.proc.stderr.end();
+    buildCall.proc.emit("close", 0);
+
+    await mock.waitForCall({ index: 1 });
+    completeRun({ call: mock.callAt({ index: 1 }) });
+
+    assert.equal(countOf({ events: await collected, type: "build-log" }), blockCount);
+  });
+
+  it("should backpressure the build log while nothing reads", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImageRaw({
+      environment: {},
+      buildArgs: {}
+    });
+
+    const buildCall = mock.callAt({ index: 0 });
+
+    // the buffers along the chain are object mode, so what matters is the chunk count
+    const block = "l".repeat(1024);
+    const blockCount = 2000;
+
+    const { backpressured } = flood({ target: buildCall.proc.stderr, block, blockCount });
+
+    assert.ok(backpressured, "the build log must be backpressured");
+
+    const collected = collectEvents<TRawRunOutputEvent>({ source: duplex });
+
+    writeImageId({ call: buildCall, imageId: "sha256:feedface" });
+    buildCall.proc.stderr.end();
+    buildCall.proc.emit("close", 0);
+
+    await mock.waitForCall({ index: 1 });
+    completeRun({ call: mock.callAt({ index: 1 }) });
+
+    const seen = textOf({ events: await collected, type: "build-log" });
+
+    assert.equal(seen.length, block.length * blockCount);
+  });
+
+});
+
+describe("createDockerBuildContext / runImage failures", () => {
+
   it("should fail gracefully when the build exits non-zero", async () => {
     const mock = createSpawnMock();
     const events = collectEvents<TRunOutputEvent>({
@@ -571,6 +797,42 @@ describe("createDockerBuildContext / runImage", () => {
 
     assert.ok(error.message.includes("exited with code 3"), error.message);
     assert.equal(mock.callCount(), 1, "no container may be started");
+  });
+
+  it("should fail on a non-zero build exit even while its stdio is still open", async () => {
+    const mock = createSpawnMock();
+    const events = collectEvents<TRunOutputEvent>({
+      source: makeContext({ spawn: mock.spawn }).runImage({ environment: {}, buildArgs: {} })
+    });
+
+    const buildCall = mock.callAt({ index: 0 });
+
+    buildCall.proc.stderr.write(`{"id":"step"}\n`);
+    buildCall.proc.emit("close", 5);
+
+    const { error } = await rejectionOf({ promise: events });
+
+    assert.ok(error.message.includes("docker build exited with code 5"), error.message);
+    assert.equal(mock.callCount(), 1, "no container may be started");
+  });
+
+  it("should fail on a non-zero container exit even while its stdio is still open", async () => {
+    const mock = createSpawnMock();
+    const events = collectEvents<TRunOutputEvent>({
+      source: makeContext({ spawn: mock.spawn }).runImage({ environment: {}, buildArgs: {} })
+    });
+
+    completeBuild({ call: mock.callAt({ index: 0 }) });
+
+    await mock.waitForCall({ index: 1 });
+    const runCall = mock.callAt({ index: 1 });
+
+    runCall.proc.stdout.write("partial output");
+    runCall.proc.emit("close", 2);
+
+    const { error } = await rejectionOf({ promise: events });
+
+    assert.ok(error.message.includes("docker run exited with code 2"), error.message);
   });
 
   it("should fail gracefully when the build reports no image id", async () => {
@@ -669,6 +931,63 @@ describe("createDockerBuildContext / runImage", () => {
     assert.equal(textOf({ events: await events, type: "stdout" }), "still fine");
   });
 
+  it("should fail, not crash, when the build context stream errors", async () => {
+    const mock = createSpawnMock();
+    const context = createPassThrough();
+    const events = collectEvents<TRunOutputEvent>({
+      source: makeContext({ spawn: mock.spawn, createContext: providing({ context }) }).runImage({ environment: {}, buildArgs: {} })
+    });
+
+    context.destroy(Error("context directory vanished"));
+
+    const { error } = await rejectionOf({ promise: events });
+
+    assert.ok(error.message.includes("context directory vanished"), error.message);
+    assert.equal(mock.callAt({ index: 0 }).proc.killCount(), 1, "the build must be stopped");
+    assert.equal(mock.callCount(), 1, "no container may be started");
+  });
+
+  it("should stop the build when the consumer destroys the duplex mid-build", async () => {
+    const mock = createSpawnMock();
+    const context = createPassThrough();
+    const duplex = makeContext({ spawn: mock.spawn, createContext: providing({ context }) }).runImage({ environment: {}, buildArgs: {} });
+
+    const closed = new Promise<void>((resolve) => {
+      duplex.once("close", () => {
+        resolve();
+      });
+    });
+
+    duplex.destroy();
+    await closed;
+    await settle();
+
+    assert.equal(mock.callAt({ index: 0 }).proc.killCount(), 1, "the build must be killed");
+    assert.ok(context.destroyed, "the context stream must be released");
+    assert.equal(mock.callCount(), 1, "no container may be started");
+  });
+
+  it("should stop the container when the consumer destroys the duplex mid-run", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({ environment: {}, buildArgs: {} });
+
+    completeBuild({ call: mock.callAt({ index: 0 }) });
+
+    await mock.waitForCall({ index: 1 });
+    const runCall = mock.callAt({ index: 1 });
+
+    const closed = new Promise<void>((resolve) => {
+      duplex.once("close", () => {
+        resolve();
+      });
+    });
+
+    duplex.destroy();
+    await closed;
+
+    assert.equal(runCall.proc.killCount(), 1, "the container must be killed");
+  });
+
   it("should fail gracefully when the build is spawned without stdio pipes", async () => {
     const mock = createSpawnMock({ withStdin: false });
     const events = collectEvents<TRunOutputEvent>({
@@ -678,6 +997,80 @@ describe("createDockerBuildContext / runImage", () => {
     const { error } = await rejectionOf({ promise: events });
 
     assert.ok(error.message.includes("without the expected stdio pipes"), error.message);
+  });
+
+});
+
+describe("createDockerBuildContext / raw log variants", () => {
+
+  it("should ask docker for plain progress and forward the log untouched", async () => {
+    const mock = createSpawnMock();
+    const events = collectEvents<TRawExportEvent>({
+      source: makeContext({ spawn: mock.spawn }).exportImageAsTarStreamRaw({ buildArgs: {} })
+    });
+
+    const call = mock.callAt({ index: 0 });
+
+    assert.ok(call.args.includes("plain"), call.args.join(" "));
+    assert.ok(!call.args.includes("rawjson"), call.args.join(" "));
+
+    call.proc.stderr.end("#1 [internal] load build definition\n");
+    call.proc.stdout.end("TAR-BYTES");
+    call.proc.emit("close", 0);
+
+    const collected = await events;
+
+    assert.equal(textOf({ events: collected, type: "build-log" }), "#1 [internal] load build definition\n");
+    assert.equal(textOf({ events: collected, type: "data" }), "TAR-BYTES");
+  });
+
+  it("should keep parsing the log as json for the default export variant", async () => {
+    const mock = createSpawnMock();
+    const events = collectEvents<TExportEvent>({
+      source: makeContext({ spawn: mock.spawn }).exportImageAsTarStream({ buildArgs: {} })
+    });
+
+    const call = mock.callAt({ index: 0 });
+
+    assert.ok(call.args.includes("rawjson"), call.args.join(" "));
+
+    call.proc.stderr.end(`{"id":"step-1"}\n`);
+    call.proc.stdout.end();
+    call.proc.emit("close", 0);
+
+    const collected = await events;
+    const [first] = collected.filter((event) => {
+      return event.type === "build-log";
+    });
+
+    assert.deepEqual(first.data, { id: "step-1" });
+  });
+
+  it("should use plain progress for the build behind runImageRaw", async () => {
+    const mock = createSpawnMock();
+    const events = collectEvents<TRawRunOutputEvent>({
+      source: makeContext({ spawn: mock.spawn }).runImageRaw({
+        environment: {},
+        buildArgs: {}
+      })
+    });
+
+    const buildCall = mock.callAt({ index: 0 });
+
+    assert.ok(buildCall.args.includes("plain"), buildCall.args.join(" "));
+    assert.ok(!buildCall.args.includes("rawjson"), buildCall.args.join(" "));
+
+    writeImageId({ call: buildCall, imageId: "sha256:feedface" });
+    buildCall.proc.stderr.end("#1 building\n");
+    buildCall.proc.emit("close", 0);
+
+    await mock.waitForCall({ index: 1 });
+    completeRun({ call: mock.callAt({ index: 1 }), stdout: "ran" });
+
+    const collected = await events;
+
+    assert.equal(textOf({ events: collected, type: "build-log" }), "#1 building\n");
+    assert.equal(textOf({ events: collected, type: "stdout" }), "ran");
   });
 
 });

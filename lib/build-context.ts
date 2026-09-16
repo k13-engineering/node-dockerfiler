@@ -33,9 +33,29 @@ const formatMapAsArgs = ({
   });
 };
 
+// with --progress rawjson the log is parsed into buildkit's progress records, with
+// --progress plain it stays the raw bytes docker wrote, ready to forward to a terminal
 type TBuildLogEvent = {
   type: "build-log";
   data: unknown;
+};
+
+type TRawBuildLogEvent = {
+  type: "build-log";
+  data: Uint8Array;
+};
+
+type TRawExportEvent = TRawBuildLogEvent | {
+  type: "data";
+  data: Uint8Array;
+};
+
+type TRawRunOutputEvent = TRawBuildLogEvent | {
+  type: "stdout";
+  data: Uint8Array;
+} | {
+  type: "stderr";
+  data: Uint8Array;
 };
 
 type TBuildEvent = TBuildLogEvent | {
@@ -96,6 +116,23 @@ const createStdinTransform = () => {
       callback(null, event.data);
     }
   });
+};
+
+// rawjson needs the buildkit records parsed out of the stream, plain progress is passed
+// through untouched so it can be written straight to a terminal
+const createBuildLogStages = ({ rawLog }: { rawLog: boolean }): stream.Duplex[] => {
+  if (rawLog) {
+    return [createTaggingTransform({ type: "build-log", objectMode: false })];
+  }
+
+  return [
+    JSONStream.parse(),
+    createTaggingTransform({ type: "build-log", objectMode: true })
+  ];
+};
+
+const progressForLog = ({ rawLog }: { rawLog: boolean }) => {
+  return rawLog ? "plain" : "rawjson";
 };
 
 const decoder = new TextDecoder();
@@ -166,18 +203,20 @@ const whenExited = ({ proc }: { proc: TChildProcess }) => {
   });
 };
 
-const destroyOnError = ({
-  target,
-  sources
+// Deliberately independent of the output streams draining: a non zero exit has to fail
+// the stream even if the process left its stdio open, so a failure can never hang.
+const whenExitedSuccessfully = async ({
+  proc,
+  action
 }: {
-  target: stream.Duplex;
-  sources: stream.Readable[];
+  proc: TChildProcess;
+  action: string;
 }) => {
-  sources.forEach((source) => {
-    source.once("error", (err) => {
-      target.destroy(err);
-    });
-  });
+  const { code } = await whenExited({ proc });
+
+  if (code !== 0) {
+    throw Error(`${action} exited with code ${code}`);
+  }
 };
 
 // A failing stdin (EPIPE, when docker stops reading the build context early) must never
@@ -185,6 +224,38 @@ const destroyOnError = ({
 const ignoreErrors = ({ target }: { target: stream.Writable }) => {
   target.once("error", () => {
     return undefined;
+  });
+};
+
+// .pipe() never listens on its source, so an error there would be an uncaught exception.
+// The caller supplied context stream is such a source.
+const failOnError = ({
+  output,
+  source
+}: {
+  output: stream.Duplex;
+  source: stream.Readable;
+}) => {
+  source.once("error", (err: Error) => {
+    output.destroy(err);
+  });
+};
+
+// Whatever closes the output, an error, the consumer giving up or a normal end, must
+// also stop what feeds it: neither the docker process nor the context still being
+// streamed into it may outlive the stream they serve.
+const stopFeedersOnClose = ({
+  output,
+  proc,
+  context
+}: {
+  output: stream.Readable;
+  proc: TChildProcess;
+  context: stream.Readable | undefined;
+}) => {
+  output.once("close", () => {
+    context?.destroy();
+    proc.kill();
   });
 };
 
@@ -211,6 +282,14 @@ const createDuplexFrom = ({
     final: (callback) => {
       input.end();
       callback();
+    },
+    // a consumer that gives up on the duplex must take both underlying streams with it
+    // the (error, callback) signature is imposed by node's stream API
+    // eslint-disable-next-line k13-engineering/prefer-single-object-parameters
+    destroy: (err, callback) => {
+      output.destroy();
+      input.destroy();
+      callback(err);
     }
   });
 
@@ -274,18 +353,43 @@ const createDockerBuildContext = ({
   spawn: TSpawn,
 }) => {
 
+  // Every build streams the context in the same way, and ties both the process and the
+  // context to the lifetime of the output stream.
+  const feedContext = ({
+    output,
+    proc,
+    stdin
+  }: {
+    output: stream.Duplex;
+    proc: TChildProcess;
+    stdin: stream.Writable;
+  }) => {
+    const context = createContextTarStream();
+
+    ignoreErrors({ target: stdin });
+    failOnError({ output, source: context });
+    stopFeedersOnClose({ output, proc, context });
+    context.pipe(stdin);
+  };
+
   // The build is left untagged: buildkit reports the content addressed image id via
   // --iidfile, which is what gets run. That avoids inventing a throwaway image name
   // that would collide between concurrent runs.
-  const buildImage = ({ buildArgs }: { buildArgs: { [key: string]: string; }; }) => {
-    const { fd: imageIdFd } = openAnonymousFile();
-
+  const spawnBuild = ({
+    buildArgs,
+    imageIdFd,
+    rawLog
+  }: {
+    buildArgs: { [key: string]: string; };
+    imageIdFd: number;
+    rawLog: boolean;
+  }) => {
     const proc = spawn("docker", [
       "buildx",
       "build", "-",
       ...(platform ? ["--platform", platform] : []),
       ...formatMapAsArgs({ flag: "--build-arg", values: buildArgs }),
-      "--progress", "rawjson",
+      "--progress", progressForLog({ rawLog }),
       "--iidfile", "/proc/self/fd/3"
     ], {
       stdio: ["pipe", "pipe", "pipe", imageIdFd]
@@ -298,35 +402,38 @@ const createDockerBuildContext = ({
       throw Error(`docker build was spawned without the expected stdio pipes`);
     }
 
+    return { proc, procStdin, procStderr };
+  };
+
+  const buildImage = ({
+    buildArgs,
+    rawLog
+  }: {
+    buildArgs: { [key: string]: string; };
+    rawLog: boolean;
+  }) => {
+    const { fd: imageIdFd } = openAnonymousFile();
+    const { proc, procStdin, procStderr } = spawnBuild({ buildArgs, imageIdFd, rawLog });
+
     const output = createObjectModeStream();
 
     const buildLog = pipeWithErrors({
       source: procStderr,
-      stages: [
-        JSONStream.parse(),
-        createTaggingTransform({ type: "build-log", objectMode: true })
-      ]
+      stages: createBuildLogStages({ rawLog })
     });
 
     buildLog.pipe(output, { end: false });
 
     // built up front so that neither the stream end nor the process exit can be missed
-    const finished = Promise.all([
-      whenFinished({ source: buildLog }),
-      whenExited({ proc })
-    ]);
+    const drained = whenFinished({ source: buildLog });
+    const exitedOk = whenExitedSuccessfully({ proc, action: "docker build" });
 
-    ignoreErrors({ target: procStdin });
-    createContextTarStream().pipe(procStdin);
+    feedContext({ output, proc, stdin: procStdin });
 
     // the image id is emitted as the final message, once every build log has been forwarded
     const finish = async () => {
       try {
-        const [, { code }] = await finished;
-
-        if (code !== 0) {
-          throw Error(`docker build exited with code ${code}`);
-        }
+        await Promise.all([drained, exitedOk]);
 
         const imageId = readFdAsText({ fd: imageIdFd });
 
@@ -348,12 +455,14 @@ const createDockerBuildContext = ({
     return output;
   };
 
-  const runImage = ({
+  const startRun = ({
     environment,
-    buildArgs
+    buildArgs,
+    rawLog
   }: {
     environment: { [key: string]: string; } | undefined;
     buildArgs: { [key: string]: string; };
+    rawLog: boolean;
   }) => {
     const output = createObjectModeStream();
     const stdinInput = createStdinTransform();
@@ -369,52 +478,77 @@ const createDockerBuildContext = ({
       });
 
       ignoreErrors({ target: proc.stdin });
+      stopFeedersOnClose({ output, proc, context: undefined });
       stdinInput.pipe(proc.stdin);
 
-      destroyOnError({ target: output, sources: [proc.stdout, proc.stderr] });
-
-      proc.stdout
-        .pipe(createTaggingTransform({ type: "stdout", objectMode: false }))
-        .pipe(output, { end: false });
-
-      proc.stderr
-        .pipe(createTaggingTransform({ type: "stderr", objectMode: false }))
-        .pipe(output, { end: false });
-
-      proc.on("error", (err) => {
-        output.destroy(err);
+      const stdoutEvents = pipeWithErrors({
+        source: proc.stdout,
+        stages: [createTaggingTransform({ type: "stdout", objectMode: false })]
       });
 
-      proc.on("close", (code) => {
-        if (code !== 0) {
-          output.destroy(Error(`docker run exited with code ${code}`));
-          return;
-        }
+      const stderrEvents = pipeWithErrors({
+        source: proc.stderr,
+        stages: [createTaggingTransform({ type: "stderr", objectMode: false })]
+      });
+
+      stdoutEvents.pipe(output, { end: false });
+      stderrEvents.pipe(output, { end: false });
+
+      const drained = Promise.all([
+        whenFinished({ source: stdoutEvents }),
+        whenFinished({ source: stderrEvents })
+      ]);
+
+      const exitedOk = whenExitedSuccessfully({ proc, action: "docker run" });
+
+      const finish = async () => {
+        await Promise.all([drained, exitedOk]);
 
         output.end();
+      };
+
+      finish().catch((err: Error) => {
+        output.destroy(err);
       });
     };
 
     const work = async () => {
-      const buildEvents = buildImage({ buildArgs });
+      const buildEvents = buildImage({ buildArgs, rawLog });
+
+      // a run stream closed while the build is still going takes the build down with it
+      output.once("close", () => {
+        buildEvents.destroy(Error(`docker build abandoned, its run stream was closed`));
+      });
 
       let imageId = "";
 
-      buildEvents.on("data", (event: TBuildEvent) => {
-        if (event.type === "image-id") {
-          imageId = event.data;
-          return;
-        }
+      // piping rather than forwarding by hand, so a slow consumer backpressures the build
+      // eslint-disable-next-line k13-engineering/no-new
+      const captureImageId = new stream.Transform({
+        objectMode: true,
+        // the (chunk, encoding, callback) signature is imposed by node's stream API
+        // eslint-disable-next-line k13-engineering/prefer-single-object-parameters
+        transform: (event: TBuildEvent, encoding, callback) => {
+          if (event.type === "image-id") {
+            imageId = event.data;
+            callback();
+            return;
+          }
 
-        output.write(event);
+          callback(null, event);
+        }
       });
 
+      const buildLogs = pipeWithErrors({ source: buildEvents, stages: [captureImageId] });
+
+      buildLogs.pipe(output, { end: false });
+
       const { buildError } = await new Promise<{ buildError: Error | undefined }>((resolve) => {
-        buildEvents.once("end", () => {
+        buildLogs.once("end", () => {
           resolve({ buildError: undefined });
         });
 
-        buildEvents.once("error", (err) => {
+        buildLogs.once("error", (err) => {
           resolve({ buildError: err });
         });
       });
@@ -438,10 +572,12 @@ const createDockerBuildContext = ({
     });
   };
 
-  const exportImageAsTarStream = ({
-    buildArgs
+  const startExport = ({
+    buildArgs,
+    rawLog
   }: {
     buildArgs: { [key: string]: string; };
+    rawLog: boolean;
   }) => {
     const proc = spawn("docker", [
       "buildx",
@@ -449,7 +585,7 @@ const createDockerBuildContext = ({
       ...(platform ? ["--platform", platform] : []),
       ...formatMapAsArgs({ flag: "--build-arg", values: buildArgs }),
       "--output", "type=tar",
-      "--progress", "rawjson"
+      "--progress", progressForLog({ rawLog })
     ], {
       stdio: ["pipe", "pipe", "pipe"]
     });
@@ -458,10 +594,7 @@ const createDockerBuildContext = ({
 
     const buildLog = pipeWithErrors({
       source: proc.stderr,
-      stages: [
-        JSONStream.parse(),
-        createTaggingTransform({ type: "build-log", objectMode: true })
-      ]
+      stages: createBuildLogStages({ rawLog })
     });
 
     const imageAsTarStream = pipeWithErrors({
@@ -472,21 +605,17 @@ const createDockerBuildContext = ({
     buildLog.pipe(output, { end: false });
     imageAsTarStream.pipe(output, { end: false });
 
-    const finished = Promise.all([
+    const drained = Promise.all([
       whenFinished({ source: buildLog }),
-      whenFinished({ source: imageAsTarStream }),
-      whenExited({ proc })
+      whenFinished({ source: imageAsTarStream })
     ]);
 
-    ignoreErrors({ target: proc.stdin });
-    createContextTarStream().pipe(proc.stdin);
+    const exitedOk = whenExitedSuccessfully({ proc, action: "docker build" });
+
+    feedContext({ output, proc, stdin: proc.stdin });
 
     const finish = async () => {
-      const [, , { code }] = await finished;
-
-      if (code !== 0) {
-        throw Error(`docker build exited with code ${code}`);
-      }
+      await Promise.all([drained, exitedOk]);
 
       output.end();
     };
@@ -498,9 +627,36 @@ const createDockerBuildContext = ({
     return output;
   };
 
+  type TRunOptions = {
+    environment: { [key: string]: string; } | undefined;
+    buildArgs: { [key: string]: string; };
+  };
+
+  type TExportOptions = {
+    buildArgs: { [key: string]: string; };
+  };
+
+  const runImage = ({ environment, buildArgs }: TRunOptions) => {
+    return startRun({ environment, buildArgs, rawLog: false });
+  };
+
+  const runImageRaw = ({ environment, buildArgs }: TRunOptions) => {
+    return startRun({ environment, buildArgs, rawLog: true });
+  };
+
+  const exportImageAsTarStream = ({ buildArgs }: TExportOptions) => {
+    return startExport({ buildArgs, rawLog: false });
+  };
+
+  const exportImageAsTarStreamRaw = ({ buildArgs }: TExportOptions) => {
+    return startExport({ buildArgs, rawLog: true });
+  };
+
   return {
     runImage,
-    exportImageAsTarStream
+    runImageRaw,
+    exportImageAsTarStream,
+    exportImageAsTarStreamRaw
   };
 };
 
@@ -515,5 +671,8 @@ export type {
   TBuildEvent,
   TExportEvent,
   TRunOutputEvent,
-  TRunInputEvent
+  TRunInputEvent,
+  TRawBuildLogEvent,
+  TRawExportEvent,
+  TRawRunOutputEvent
 };
