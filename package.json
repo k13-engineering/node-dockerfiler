@@ -5,7 +5,7 @@
   "scripts": {
     "build": "rm -rf dist/ && deno-node-build --root . --out dist/ --entry lib/index.ts",
     "type-check": "tsc --noEmit",
-    "test": "c8 --reporter lcov --reporter html --reporter text --all --include lib/ mocha --timeout 120000",
+    "test": "c8 --reporter lcov --reporter html --reporter text --all --include lib/ --exclude lib/**/*.spec.ts mocha lib/**/*.spec.ts",
     "lint": "eslint .",
     "update-deps": "npm-check-updates -u"
   },
@@ -19,6 +19,7 @@
     "@k13engineering/eslint-rules": "^0.0.6",
     "@k13engineering/releasetool": "^0.0.5",
     "@types/dockerode": "^3.3.32",
+    "@types/mocha": "^10.0.10",
     "@types/node": "^25.6.0",
     "@types/tar-fs": "^2.0.4",
     "c8": "^11.0.0",

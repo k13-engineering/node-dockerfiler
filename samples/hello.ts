@@ -1,11 +1,15 @@
-import { create, createContextTarStreamFromDirectory } from "../lib/index.ts";
+import {
+  createDefaultDockerBuildContext,
+  createContextTarStreamFromDirectory
+} from "../lib/index.ts";
+import type { TExportEvent } from "../lib/index.ts";
 
 const dockerfileContent = `
   FROM debian:buster
   CMD echo Hello, World!
 `;
 
-const d = create({
+const d = createDefaultDockerBuildContext({
   createContextTarStream: () => {
     return createContextTarStreamFromDirectory({
       context: ".",
@@ -16,12 +20,15 @@ const d = create({
   platform: undefined
 });
 
-const { imageAsTarStream, log } = d.exportImageAsTarStream();
-
-log.on("data", (data) => {
-  console.log("log", data);
+const events = d.exportImageAsTarStream({
+  buildArgs: {}
 });
 
-imageAsTarStream.on("data", (data) => {
-  console.log("imageAsTarStream", data);
+events.on("data", (event: TExportEvent) => {
+  if (event.type === "build-log") {
+    console.log("build-log", event.data);
+    return;
+  }
+
+  console.log("data", event.data.length);
 });
