@@ -135,27 +135,27 @@ const progressForLog = ({ rawLog }: { rawLog: boolean }) => {
   return rawLog ? "plain" : "rawjson";
 };
 
-const decoder = new TextDecoder();
+// buildx unlinks the --iidfile path and creates it afresh before writing the image id,
+// so it has to be a real, removable directory entry. Handing it an already open
+// descriptor as /proc/self/fd/<n> fails with EPERM: such an entry cannot be unlinked.
+// The file lives in a directory of its own, which is removed once the id has been read.
+const createImageIdFile = () => {
+  const directory = fs.mkdtempSync(path.join(os.tmpdir(), "node-dockerfiler-"));
+  const filePath = path.join(directory, "iid");
 
-// node does not expose O_TMPFILE, so it is composed from the linux fcntl.h definition
-// O_TMPFILE = __O_TMPFILE | O_DIRECTORY, taking O_DIRECTORY from the platform constants.
-const O_TMPFILE = 0o20000000 | fs.constants.O_DIRECTORY;
+  const read = () => {
+    if (!fs.existsSync(filePath)) {
+      return "";
+    }
 
-// A file that never has a name: the kernel creates an unnamed inode in the given
-// directory's filesystem and reclaims it once the descriptor closes. Nothing is ever
-// linked into the directory, so there is no path to collide with and nothing to clean up.
-// The child reaches it through the inherited descriptor as /proc/self/fd/<n>.
-const openAnonymousFile = () => {
-  const fd = fs.openSync(os.tmpdir(), O_TMPFILE | fs.constants.O_RDWR, 0o600);
+    return fs.readFileSync(filePath, "utf-8").trim();
+  };
 
-  return { fd };
-};
+  const cleanup = () => {
+    fs.rmSync(directory, { recursive: true, force: true });
+  };
 
-const readFdAsText = ({ fd }: { fd: number }) => {
-  const buffer = new Uint8Array(1024);
-  const bytesRead = fs.readSync(fd, buffer, 0, buffer.length, 0);
-
-  return decoder.decode(buffer.subarray(0, bytesRead)).trim();
+  return { filePath, read, cleanup };
 };
 
 // Errors do not travel across .pipe(), and intermediate stages such as JSONStream are
@@ -377,32 +377,23 @@ const createDockerBuildContext = ({
   // that would collide between concurrent runs.
   const spawnBuild = ({
     buildArgs,
-    imageIdFd,
+    imageIdPath,
     rawLog
   }: {
     buildArgs: { [key: string]: string; };
-    imageIdFd: number;
+    imageIdPath: string;
     rawLog: boolean;
   }) => {
-    const proc = spawn("docker", [
+    return spawn("docker", [
       "buildx",
       "build", "-",
       ...(platform ? ["--platform", platform] : []),
       ...formatMapAsArgs({ flag: "--build-arg", values: buildArgs }),
       "--progress", progressForLog({ rawLog }),
-      "--iidfile", "/proc/self/fd/3"
+      "--iidfile", imageIdPath
     ], {
-      stdio: ["pipe", "pipe", "pipe", imageIdFd]
+      stdio: ["pipe", "pipe", "pipe"]
     });
-
-    const { stdin: procStdin, stderr: procStderr } = proc;
-
-    if (procStdin === null || procStderr === null) {
-      fs.closeSync(imageIdFd);
-      throw Error(`docker build was spawned without the expected stdio pipes`);
-    }
-
-    return { proc, procStdin, procStderr };
   };
 
   const buildImage = ({
@@ -412,13 +403,13 @@ const createDockerBuildContext = ({
     buildArgs: { [key: string]: string; };
     rawLog: boolean;
   }) => {
-    const { fd: imageIdFd } = openAnonymousFile();
-    const { proc, procStdin, procStderr } = spawnBuild({ buildArgs, imageIdFd, rawLog });
+    const imageIdFile = createImageIdFile();
+    const proc = spawnBuild({ buildArgs, imageIdPath: imageIdFile.filePath, rawLog });
 
     const output = createObjectModeStream();
 
     const buildLog = pipeWithErrors({
-      source: procStderr,
+      source: proc.stderr,
       stages: createBuildLogStages({ rawLog })
     });
 
@@ -428,14 +419,14 @@ const createDockerBuildContext = ({
     const drained = whenFinished({ source: buildLog });
     const exitedOk = whenExitedSuccessfully({ proc, action: "docker build" });
 
-    feedContext({ output, proc, stdin: procStdin });
+    feedContext({ output, proc, stdin: proc.stdin });
 
     // the image id is emitted as the final message, once every build log has been forwarded
     const finish = async () => {
       try {
         await Promise.all([drained, exitedOk]);
 
-        const imageId = readFdAsText({ fd: imageIdFd });
+        const imageId = imageIdFile.read();
 
         if (imageId === "") {
           throw Error(`docker build did not report an image id`);
@@ -444,7 +435,7 @@ const createDockerBuildContext = ({
         output.write({ type: "image-id", data: imageId });
         output.end();
       } finally {
-        fs.closeSync(imageIdFd);
+        imageIdFile.cleanup();
       }
     };
 

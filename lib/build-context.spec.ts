@@ -29,7 +29,7 @@ const createPassThrough = () => {
 };
 
 type TFakeProcess = {
-  stdin: stream.PassThrough | null;
+  stdin: stream.PassThrough;
   stdout: stream.PassThrough;
   stderr: stream.PassThrough;
   on: (event: string, listener: (...args: unknown[]) => void) => void;
@@ -39,20 +39,18 @@ type TFakeProcess = {
   killCount: () => number;
 };
 
-const createFakeProcess = ({ withStdin }: { withStdin: boolean }): TFakeProcess => {
+const createFakeProcess = (): TFakeProcess => {
   // eslint-disable-next-line k13-engineering/no-new
   const events = new EventEmitter();
 
   const stdout = createPassThrough();
   const stderr = createPassThrough();
-  const stdin = withStdin ? createPassThrough() : null;
+  const stdin = createPassThrough();
 
   let kills = 0;
 
-  if (stdin !== null) {
-    // the library pipes the build context in; nothing here consumes it
-    stdin.resume();
-  }
+  // the library pipes the build context in; nothing here consumes it
+  stdin.resume();
 
   // these mirror the positional signatures of the node APIs being stood in for
   /* eslint-disable k13-engineering/prefer-single-object-parameters */
@@ -90,7 +88,7 @@ type TSpawnCall = {
   proc: TFakeProcess;
 };
 
-const createSpawnMock = ({ withStdin = true }: { withStdin?: boolean } = {}) => {
+const createSpawnMock = () => {
   let calls: TSpawnCall[] = [];
   let waiters: { index: number; resolve: () => void }[] = [];
 
@@ -109,7 +107,7 @@ const createSpawnMock = ({ withStdin = true }: { withStdin?: boolean } = {}) => 
   // matches the positional signature of child_process.spawn
   // eslint-disable-next-line k13-engineering/prefer-single-object-parameters
   const spawn = (command: string, args: string[], options: { stdio: unknown[] }) => {
-    const proc = createFakeProcess({ withStdin });
+    const proc = createFakeProcess();
 
     calls = [...calls, { command, args, stdio: options.stdio, proc }];
     releaseWaiters();
@@ -215,10 +213,12 @@ const countOf = ({
   }).length;
 };
 
+// buildx unlinks the path and writes it afresh; the fake does the same
 const writeImageId = ({ call, imageId }: { call: TSpawnCall; imageId: string }) => {
-  const fd = call.stdio[3] as number;
+  const imageIdPath = call.args[call.args.indexOf("--iidfile") + 1];
 
-  fs.writeSync(fd, imageId, 0);
+  fs.rmSync(imageIdPath, { force: true });
+  fs.writeFileSync(imageIdPath, `${imageId}\n`);
 };
 
 // drives a fake "docker buildx build" through a successful run
@@ -272,6 +272,17 @@ const flood = ({
   });
 
   return { backpressured };
+};
+
+// buildx unlinks and recreates the iidfile, so it must be a real, writable location
+// rather than a descriptor path such as /proc/self/fd/3, which cannot be unlinked
+const assertUsableImageIdPath = ({ call }: { call: TSpawnCall }) => {
+  const imageIdPath = call.args[call.args.indexOf("--iidfile") + 1];
+
+  assert.ok(call.args.includes("--iidfile"));
+  assert.ok(nodePath.isAbsolute(imageIdPath), imageIdPath);
+  assert.ok(!imageIdPath.startsWith("/proc/"), `must not be a descriptor path: ${imageIdPath}`);
+  assert.ok(fs.existsSync(nodePath.dirname(imageIdPath)), "its directory must exist");
 };
 
 const settle = () => {
@@ -484,7 +495,7 @@ describe("createDockerBuildContext / exportImageAsTarStream", () => {
     const call = mock.callAt({ index: 0 });
 
     // docker stopped reading the context; this must not take the process down
-    call.proc.stdin?.emit("error", Error("EPIPE"));
+    call.proc.stdin.emit("error", Error("EPIPE"));
 
     call.proc.stderr.end();
     call.proc.stdout.end();
@@ -505,8 +516,7 @@ describe("createDockerBuildContext / runImage", () => {
 
     const buildCall = mock.callAt({ index: 0 });
 
-    assert.ok(buildCall.args.includes("--iidfile"));
-    assert.ok(buildCall.args.includes("/proc/self/fd/3"));
+    assertUsableImageIdPath({ call: buildCall });
     assert.ok(!buildCall.args.includes("--tag"));
 
     completeBuild({ call: buildCall, imageId: "sha256:abc123" });
@@ -611,7 +621,7 @@ describe("createDockerBuildContext / runImage", () => {
     const forwarded = await new Promise<string>((resolve) => {
       let seen = "";
 
-      runCall.proc.stdin?.on("data", (chunk: Uint8Array) => {
+      runCall.proc.stdin.on("data", (chunk: Uint8Array) => {
         seen = `${seen}${decoder.decode(chunk)}`;
 
         if (seen.includes("ping")) {
@@ -644,7 +654,7 @@ describe("createDockerBuildContext / runImage", () => {
     const runCall = mock.callAt({ index: 1 });
 
     let forwarded = "";
-    runCall.proc.stdin?.on("data", (chunk: Uint8Array) => {
+    runCall.proc.stdin.on("data", (chunk: Uint8Array) => {
       forwarded = `${forwarded}${decoder.decode(chunk)}`;
     });
 
@@ -918,14 +928,14 @@ describe("createDockerBuildContext / runImage failures", () => {
     });
 
     const buildCall = mock.callAt({ index: 0 });
-    buildCall.proc.stdin?.emit("error", Error("EPIPE"));
+    buildCall.proc.stdin.emit("error", Error("EPIPE"));
 
     completeBuild({ call: buildCall });
 
     await mock.waitForCall({ index: 1 });
     const runCall = mock.callAt({ index: 1 });
 
-    runCall.proc.stdin?.emit("error", Error("EPIPE"));
+    runCall.proc.stdin.emit("error", Error("EPIPE"));
     completeRun({ call: runCall, stdout: "still fine" });
 
     assert.equal(textOf({ events: await events, type: "stdout" }), "still fine");
@@ -967,6 +977,20 @@ describe("createDockerBuildContext / runImage failures", () => {
     assert.equal(mock.callCount(), 1, "no container may be started");
   });
 
+  it("should fail gracefully when spawning the build throws", async () => {
+    const throwingSpawn = (() => {
+      throw Error("spawn is not permitted");
+    }) as unknown as TSpawn;
+
+    const events = collectEvents<TRunOutputEvent>({
+      source: makeContext({ spawn: throwingSpawn }).runImage({ environment: {}, buildArgs: {} })
+    });
+
+    const { error } = await rejectionOf({ promise: events });
+
+    assert.ok(error.message.includes("spawn is not permitted"), error.message);
+  });
+
   it("should stop the container when the consumer destroys the duplex mid-run", async () => {
     const mock = createSpawnMock();
     const duplex = makeContext({ spawn: mock.spawn }).runImage({ environment: {}, buildArgs: {} });
@@ -986,17 +1010,6 @@ describe("createDockerBuildContext / runImage failures", () => {
     await closed;
 
     assert.equal(runCall.proc.killCount(), 1, "the container must be killed");
-  });
-
-  it("should fail gracefully when the build is spawned without stdio pipes", async () => {
-    const mock = createSpawnMock({ withStdin: false });
-    const events = collectEvents<TRunOutputEvent>({
-      source: makeContext({ spawn: mock.spawn }).runImage({ environment: {}, buildArgs: {} })
-    });
-
-    const { error } = await rejectionOf({ promise: events });
-
-    assert.ok(error.message.includes("without the expected stdio pipes"), error.message);
   });
 
 });
