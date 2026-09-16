@@ -1,0 +1,27 @@
+{
+  "name": "node-dockerfiler",
+  "type": "module",
+  "description": "Node.js library to run Dockerfiles easily",
+  "publishConfig": {
+    "access": "public"
+  },
+  "files": [
+    "dist"
+  ],
+  "main": "dist/lib/index.js",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/k13-engineering/node-dockerfiler.git"
+  },
+  "keywords": [
+    "architecture",
+    "test",
+    "docker"
+  ],
+  "author": "Simon Kadisch",
+  "license": "LGPL 2.1",
+  "bugs": {
+    "url": "https://github.com/k13-engineering/node-dockerfiler/issues"
+  },
+  "homepage": "https://github.com/k13-engineering/node-dockerfiler#readme"
+}
