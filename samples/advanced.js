@@ -1,4 +1,5 @@
 import dockerfiler from "../lib/index.js";
+import process from "node:process";
 
 const dockerfileContent = `
   FROM debian:buster
@@ -7,19 +8,19 @@ const dockerfileContent = `
 await dockerfiler.run({
   dockerfileContent,
   // build context directory
-  "context": ".",
+  context: ".",
   // options passed to docker (see https://docs.docker.com/engine/api/v1.37/#operation/ContainerCreate)
-  "options": {
-    "Env": [
+  options: {
+    Env: [
       "MYENV=World"
     ]
   },
   // callback to allow ignoring files sent to build context
-  "ignore": () => {
+  ignore: () => {
     return false;
   },
   // command to execute when running the container
-  "command": [ "/bin/bash", "-c", "echo Hello, ${MYENV}!" ],
+  command: [ "/bin/bash", "-c", "echo Hello, ${MYENV}!" ],
   // where to write the logs
-  "logSink": process.stderr
+  logSink: process.stderr
 });

@@ -7,6 +7,11 @@ import child_process from "node:child_process";
 // @ts-expect-error missing types
 import JSONStream from "JSONStream";
 
+const createObjectModeStream = () => {
+  // eslint-disable-next-line k13-engineering/no-new
+  return new stream.PassThrough({ objectMode: true });
+};
+
 const createContextTarStreamFromDirectory = ({
   context,
   ignore: userIgnore,
@@ -25,10 +30,10 @@ const createContextTarStreamFromDirectory = ({
   }
 
   const pack = tarFs.pack(context, {
-    "finalize": false,
+    finalize: false,
     ignore,
-    "finish": () => {
-      pack.entry({ "name": "Dockerfile" }, dockerfileContent);
+    finish: () => {
+      pack.entry({ name: "Dockerfile" }, dockerfileContent);
       pack.finalize();
     }
   });
@@ -55,7 +60,7 @@ const create = ({
       stdio: ["pipe", "pipe", "pipe"]
     });
 
-    const log = new stream.PassThrough({ objectMode: true });
+    const log = createObjectModeStream();
     proc.stderr.pipe(JSONStream.parse()).pipe(log);
 
     const contextAsTarStream = createContextTarStream();
@@ -74,7 +79,7 @@ const create = ({
   }) => {
     let environmentArgs: string[] = [];
 
-    const log = new stream.PassThrough({ objectMode: true });
+    const log = createObjectModeStream();
 
     const work = async () => {
       const { log: buildLog } = buildImage({ tagName: "temp" });
@@ -120,7 +125,7 @@ const create = ({
 
       proc.on("close", (code) => {
         if (code !== 0) {
-          log.destroy(new Error(`docker run exited with code ${code}`));
+          log.destroy(Error(`docker run exited with code ${code}`));
           return;
         }
         log.end();
@@ -150,7 +155,7 @@ const create = ({
 
     const imageAsTarStream = proc.stdout;
 
-    const log = new stream.PassThrough({ objectMode: true });
+    const log = createObjectModeStream();
     proc.stderr.pipe(JSONStream.parse()).pipe(log);
 
     contextAsTarStream.pipe(proc.stdin);
@@ -162,6 +167,7 @@ const create = ({
   };
 
   return {
+    runImage,
     exportImageAsTarStream
   };
 };

@@ -12,12 +12,11 @@ const d = create({
       dockerfileContent,
       ignore: undefined
     });
-  }
+  },
+  platform: undefined
 });
 
-const { imageAsTarStream, log } = d.exportImageAsTarStream({
-  
-});
+const { imageAsTarStream, log } = d.exportImageAsTarStream();
 
 log.on("data", (data) => {
   console.log("log", data);

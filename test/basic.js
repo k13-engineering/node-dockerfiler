@@ -11,13 +11,20 @@ import url from "url";
 const scriptPath = url.fileURLToPath(import.meta.url);
 const dirnameOfScript = path.dirname(scriptPath);
 
-const dummySink = new stream.Writable({
-  write () {}
-});
+const createDummySink = () => {
+  // eslint-disable-next-line k13-engineering/no-new
+  return new stream.Writable({
+    // the (chunk, encoding, callback) signature is imposed by node's stream API
+    // eslint-disable-next-line k13-engineering/prefer-single-object-parameters
+    write: (chunk, encoding, callback) => {
+      callback();
+    }
+  });
+};
 
-describe("node-dockerfiler", function () {
-  this.timeout(120 * 1000);
+const dummySink = createDummySink();
 
+describe("node-dockerfiler", () => {
   it("should run Dockerfiles correctly", async () => {
     const dockerfileContent = `
       FROM debian:buster
@@ -27,8 +34,8 @@ describe("node-dockerfiler", function () {
 
     const result = await dockerfiler.run({
       dockerfileContent,
-      "context": path.resolve(dirnameOfScript),
-      "logSink": dummySink
+      context: path.resolve(dirnameOfScript),
+      logSink: dummySink
     });
     assert.equal(result.StatusCode, 0);
   });
@@ -42,8 +49,8 @@ describe("node-dockerfiler", function () {
 
     const result = await dockerfiler.run({
       dockerfileContent,
-      "context": path.resolve(dirnameOfScript, "context"),
-      "logSink": dummySink
+      context: path.resolve(dirnameOfScript, "context"),
+      logSink: dummySink
     });
     assert.equal(result.StatusCode, 1);
   });
@@ -60,8 +67,8 @@ describe("node-dockerfiler", function () {
 
     const result = await dockerfiler.run({
       dockerfileContent,
-      "context": path.resolve(dirnameOfScript, "context"),
-      "logSink": dummySink
+      context: path.resolve(dirnameOfScript, "context"),
+      logSink: dummySink
     });
     assert.equal(result.StatusCode, 0);
   });
@@ -78,11 +85,11 @@ describe("node-dockerfiler", function () {
 
     const result = await dockerfiler.run({
       dockerfileContent,
-      "context": path.resolve(dirnameOfScript, "context"),
-      "ignore": (name) => {
+      context: path.resolve(dirnameOfScript, "context"),
+      ignore: (name) => {
         return name === "unwanted.txt";
       },
-      "logSink": dummySink
+      logSink: dummySink
     });
     assert.equal(result.StatusCode, 1);
   });
