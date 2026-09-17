@@ -25,14 +25,19 @@ import {
 
 const createDefaultDockerBuildContext = ({
   createContextTarStream,
-  platform
+  platform,
+  // how long docker is given to stop on its own when a stream is destroyed, before the
+  // process is killed outright; leaving it out keeps the default
+  killGracePeriodMs
 }: {
   createContextTarStream: () => stream.Readable,
   platform: string | undefined,
+  killGracePeriodMs?: number | undefined,
 }) => {
   return createDockerBuildContext({
     createContextTarStream,
     platform,
+    killGracePeriodMs,
     spawn: child_process.spawn
   });
 };

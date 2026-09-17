@@ -1,7 +1,9 @@
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "path";
 import stream from "stream";
+import { setTimeout, clearTimeout } from "node:timers";
 
 import tarFs from "tar-fs";
 import type { Options } from "tar-fs";
@@ -241,21 +243,100 @@ const failOnError = ({
   });
 };
 
+// How long a docker process is given to wind down on its own after SIGTERM, before it is
+// taken down the hard way.
+const defaultKillGracePeriodMs = 5000;
+
+// SIGTERM first, because that is what docker acts on: buildx cancels the build it is
+// running rather than leaving it half done. A process that ignores the signal would
+// outlive the stream it serves, so the kill escalates to SIGKILL once the grace period is
+// up. The escalation timer is unref'd, so waiting for a process to die can never be the
+// reason the host process stays alive, and it is cleared as soon as the process is gone.
+// Reports whether a live process was signalled at all, which tells the caller whether
+// anything may still be left behind.
+const stopProcess = ({
+  proc,
+  killGracePeriodMs
+}: {
+  proc: TChildProcess;
+  killGracePeriodMs: number;
+}): boolean => {
+  let exited = false;
+
+  proc.once("close", () => {
+    exited = true;
+  });
+
+  // false means the signal could not be delivered, which for an already exited process is
+  // the normal case: there is then nothing left to escalate against
+  const signalled = proc.kill("SIGTERM");
+
+  if (!signalled || exited) {
+    return signalled;
+  }
+
+  const escalation = setTimeout(() => {
+    proc.kill("SIGKILL");
+  }, killGracePeriodMs);
+
+  escalation.unref();
+
+  proc.once("close", () => {
+    clearTimeout(escalation);
+  });
+
+  return true;
+};
+
+// Stopping the docker run client does not stop what it started. The client dies with the
+// signal rather than passing it on, and even when it does pass it on, a container's PID 1
+// ignores a signal it has installed no handler for, which is the usual case for a CMD.
+// The container would then keep running with nothing attached to it, so it is removed
+// outright, by the name every run is given for exactly this purpose.
+const removeContainer = ({
+  spawn,
+  containerName
+}: {
+  spawn: TSpawn;
+  containerName: string;
+}) => {
+  const remover = spawn("docker", ["rm", "--force", containerName], { stdio: "ignore" });
+
+  // a container that stopped on its own is already gone, which makes this fail. There is
+  // nothing to report either way, and nothing may be left waiting on it.
+  remover.once("error", () => {
+    return undefined;
+  });
+
+  remover.unref();
+};
+
 // Whatever closes the output, an error, the consumer giving up or a normal end, must
 // also stop what feeds it: neither the docker process nor the context still being
 // streamed into it may outlive the stream they serve.
 const stopFeedersOnClose = ({
   output,
   proc,
-  context
+  context,
+  killGracePeriodMs,
+  removeLeftovers
 }: {
   output: stream.Readable;
   proc: TChildProcess;
   context: stream.Readable | undefined;
+  killGracePeriodMs: number;
+  removeLeftovers: (() => void) | undefined;
 }) => {
   output.once("close", () => {
     context?.destroy();
-    proc.kill();
+
+    const signalled = stopProcess({ proc, killGracePeriodMs });
+
+    // nothing to signal means the process had already finished on its own, and with --rm
+    // it took its container with it
+    if (signalled) {
+      removeLeftovers?.();
+    }
   });
 };
 
@@ -346,11 +427,13 @@ const createContextTarStreamFromDirectory = ({
 const createDockerBuildContext = ({
   createContextTarStream,
   platform,
-  spawn
+  spawn,
+  killGracePeriodMs = defaultKillGracePeriodMs
 }: {
   createContextTarStream: () => stream.Readable,
   platform: string | undefined,
   spawn: TSpawn,
+  killGracePeriodMs?: number | undefined,
 }) => {
 
   // Every build streams the context in the same way, and ties both the process and the
@@ -368,7 +451,7 @@ const createDockerBuildContext = ({
 
     ignoreErrors({ target: stdin });
     failOnError({ output, source: context });
-    stopFeedersOnClose({ output, proc, context });
+    stopFeedersOnClose({ output, proc, context, killGracePeriodMs, removeLeftovers: undefined });
     context.pipe(stdin);
   };
 
@@ -459,8 +542,14 @@ const createDockerBuildContext = ({
     const stdinInput = createStdinTransform();
 
     const startContainer = ({ imageId }: { imageId: string }) => {
+      // --rm so a container that stops on its own is gone with it, and a name so that one
+      // that does not can still be removed after the client it was started by is dead
+      const containerName = `node-dockerfiler-${randomUUID()}`;
+
       const proc = spawn("docker", [
         "run",
+        "--rm",
+        "--name", containerName,
         "-i",
         ...formatMapAsArgs({ flag: "-e", values: environment }),
         imageId
@@ -469,7 +558,16 @@ const createDockerBuildContext = ({
       });
 
       ignoreErrors({ target: proc.stdin });
-      stopFeedersOnClose({ output, proc, context: undefined });
+
+      stopFeedersOnClose({
+        output,
+        proc,
+        context: undefined,
+        killGracePeriodMs,
+        removeLeftovers: () => {
+          removeContainer({ spawn, containerName });
+        }
+      });
       stdinInput.pipe(proc.stdin);
 
       const stdoutEvents = pipeWithErrors({

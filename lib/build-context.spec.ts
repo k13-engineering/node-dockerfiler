@@ -8,7 +8,7 @@ import fs from "node:fs";
 import os from "node:os";
 import nodePath from "node:path";
 import stream from "node:stream";
-import { setImmediate } from "node:timers";
+import { setImmediate, setTimeout } from "node:timers";
 
 import { createDockerBuildContext, createContextTarStreamFromDirectory } from "./build-context.ts";
 import type {
@@ -35,11 +35,20 @@ type TFakeProcess = {
   on: (event: string, listener: (...args: unknown[]) => void) => void;
   once: (event: string, listener: (...args: unknown[]) => void) => void;
   emit: (event: string, ...args: unknown[]) => void;
-  kill: () => boolean;
+  kill: (signal?: string) => boolean;
+  unref: () => void;
   killCount: () => number;
+  signalsSent: () => string[];
+  hasExited: () => boolean;
 };
 
-const createFakeProcess = (): TFakeProcess => {
+// ignoresSigterm stands in for a docker process that will not wind down on its own, so
+// that the escalation to SIGKILL can be observed
+const createFakeProcess = ({
+  ignoresSigterm = false
+}: {
+  ignoresSigterm?: boolean;
+} = {}): TFakeProcess => {
   // eslint-disable-next-line k13-engineering/no-new
   const events = new EventEmitter();
 
@@ -47,10 +56,25 @@ const createFakeProcess = (): TFakeProcess => {
   const stderr = createPassThrough();
   const stdin = createPassThrough();
 
-  let kills = 0;
+  let signals: string[] = [];
+  let exited = false;
 
   // the library pipes the build context in; nothing here consumes it
   stdin.resume();
+
+  // mirrors the positional signature of EventEmitter.emit
+  // eslint-disable-next-line k13-engineering/prefer-single-object-parameters
+  const emit = (event: string, ...args: unknown[]) => {
+    if (event === "close") {
+      exited = true;
+    }
+
+    events.emit(event, ...args);
+  };
+
+  const endsTheProcess = ({ signal }: { signal: string }) => {
+    return !ignoresSigterm || signal === "SIGKILL";
+  };
 
   // these mirror the positional signatures of the node APIs being stood in for
   /* eslint-disable k13-engineering/prefer-single-object-parameters */
@@ -64,18 +88,34 @@ const createFakeProcess = (): TFakeProcess => {
     once: (event, listener) => {
       events.once(event, listener);
     },
-    emit: (event, ...args) => {
-      events.emit(event, ...args);
-    },
-    // like a real process, a killed one closes with no exit code
-    kill: () => {
-      kills += 1;
-      events.emit("close", null);
+    emit,
+    // node reports a signal it could not deliver as false, which is what an already
+    // exited process does; a killed one closes with no exit code
+    kill: (signal = "SIGTERM") => {
+      if (exited) {
+        return false;
+      }
+
+      signals = [...signals, signal];
+
+      if (endsTheProcess({ signal })) {
+        emit("close", null);
+      }
 
       return true;
     },
+    // the library unrefs the processes it does not wait for
+    unref: () => {
+      return undefined;
+    },
     killCount: () => {
-      return kills;
+      return signals.length;
+    },
+    signalsSent: () => {
+      return signals;
+    },
+    hasExited: () => {
+      return exited;
     }
   };
   /* eslint-enable k13-engineering/prefer-single-object-parameters */
@@ -84,11 +124,22 @@ const createFakeProcess = (): TFakeProcess => {
 type TSpawnCall = {
   command: string;
   args: string[];
-  stdio: unknown[];
+  stdio: unknown;
   proc: TFakeProcess;
 };
 
-const createSpawnMock = () => {
+// onSpawn runs while the process is being created, which is the only way to reproduce a
+// consumer that gives up in the window between deciding to start docker and being able to
+// tie its lifetime to the stream
+const createSpawnMock = ({
+  ignoresSigterm = false,
+  onSpawn = () => {
+    return undefined;
+  }
+}: {
+  ignoresSigterm?: boolean;
+  onSpawn?: (details: { index: number }) => void;
+} = {}) => {
   let calls: TSpawnCall[] = [];
   let waiters: { index: number; resolve: () => void }[] = [];
 
@@ -106,10 +157,12 @@ const createSpawnMock = () => {
 
   // matches the positional signature of child_process.spawn
   // eslint-disable-next-line k13-engineering/prefer-single-object-parameters
-  const spawn = (command: string, args: string[], options: { stdio: unknown[] }) => {
-    const proc = createFakeProcess();
+  const spawn = (command: string, args: string[], options: { stdio: unknown }) => {
+    const proc = createFakeProcess({ ignoresSigterm });
+    const index = calls.length;
 
     calls = [...calls, { command, args, stdio: options.stdio, proc }];
+    onSpawn({ index });
     releaseWaiters();
 
     return proc;
@@ -158,15 +211,18 @@ const providing = ({ context }: { context: stream.Readable }) => {
 const makeContext = ({
   spawn,
   platform = undefined,
-  createContext = endedContext
+  createContext = endedContext,
+  killGracePeriodMs = undefined
 }: {
   spawn: TSpawn;
   platform?: string | undefined;
   createContext?: () => stream.Readable;
+  killGracePeriodMs?: number | undefined;
 }) => {
   return createDockerBuildContext({
     createContextTarStream: createContext,
     platform,
+    killGracePeriodMs,
     spawn
   });
 };
@@ -211,6 +267,17 @@ const countOf = ({
   return events.filter((event) => {
     return event.type === type;
   }).length;
+};
+
+// every run gets a generated container name, which the argument assertions are not about
+const withoutName = ({ args }: { args: string[] }) => {
+  const at = args.indexOf("--name");
+
+  return [...args.slice(0, at), ...args.slice(at + 2)];
+};
+
+const containerNameOf = ({ call }: { call: TSpawnCall }) => {
+  return call.args[call.args.indexOf("--name") + 1];
 };
 
 // buildx unlinks the path and writes it afresh; the fake does the same
@@ -288,6 +355,121 @@ const assertUsableImageIdPath = ({ call }: { call: TSpawnCall }) => {
 const settle = () => {
   return new Promise<void>((resolve) => {
     setImmediate(resolve);
+  });
+};
+
+// Destroying has to complete on its own; a test that needs this to time out has already
+// found the hang it was looking for.
+const destroyAndWaitForClose = async ({
+  target,
+  error = undefined
+}: {
+  target: stream.Readable;
+  error?: Error | undefined;
+}) => {
+  const closed = new Promise<void>((resolve) => {
+    // a stream that is already gone will not emit "close" a second time
+    if (target.destroyed) {
+      resolve();
+      return;
+    }
+
+    target.once("close", resolve);
+  });
+
+  // a destroy with an error still has to be observable, so it is never left unhandled
+  target.once("error", () => {
+    return undefined;
+  });
+
+  target.destroy(error);
+
+  await closed;
+
+  // whatever the destroy set in motion has to have run by the time this returns
+  await settle();
+  await settle();
+};
+
+const callsMade = ({ mock }: { mock: ReturnType<typeof createSpawnMock> }) => {
+  return Array.from({ length: mock.callCount() }).map((ignored, index) => {
+    return mock.callAt({ index });
+  });
+};
+
+const isRemoval = ({ call }: { call: TSpawnCall }) => {
+  return call.args[0] === "rm";
+};
+
+// A container outlives the client that started it, so a run whose client had to be
+// signalled is only really stopped once the container has been removed as well.
+const assertContainerRemoved = ({
+  call,
+  removed
+}: {
+  call: TSpawnCall;
+  removed: string[];
+}) => {
+  if (call.args[0] !== "run" || call.proc.killCount() === 0) {
+    return;
+  }
+
+  assert.ok(
+    removed.includes(containerNameOf({ call })),
+    `the container of "${call.args.join(" ")}" was left behind`
+  );
+};
+
+// The point of every destroy test: once the stream is gone, nothing docker was asked to
+// do may still be running, whichever stage it had reached.
+const assertNothingLeftRunning = ({ mock }: { mock: ReturnType<typeof createSpawnMock> }) => {
+  const calls = callsMade({ mock });
+
+  const removed = calls.filter((call) => {
+    return isRemoval({ call });
+  }).map((call) => {
+    return call.args[call.args.length - 1];
+  });
+
+  calls.filter((call) => {
+    return !isRemoval({ call });
+  }).forEach((call) => {
+    assert.ok(
+      call.proc.hasExited(),
+      `"${call.command} ${call.args.join(" ")}" is still running`
+    );
+
+    assertContainerRemoved({ call, removed });
+  });
+};
+
+// createImageIdFile makes one directory per build; a destroyed stream has to take it with
+// it, or every abandoned build would leave one behind
+const imageIdDirectoryOf = ({ call }: { call: TSpawnCall }) => {
+  return nodePath.dirname(call.args[call.args.indexOf("--iidfile") + 1]);
+};
+
+// for the few things that cannot be observed by awaiting a stream event, such as a kill
+// that only escalates once a grace period has passed
+const waitUntil = ({ condition }: { condition: () => boolean }) => {
+  return new Promise<void>((resolve, reject) => {
+    const deadline = Date.now() + 2000;
+
+    const poll = () => {
+      if (condition()) {
+        resolve();
+        return;
+      }
+
+      if (Date.now() > deadline) {
+        reject(Error(`timed out waiting for the condition`));
+        return;
+      }
+
+      setTimeout(poll, 1);
+    };
+
+    poll();
   });
 };
 
@@ -524,7 +706,7 @@ describe("createDockerBuildContext / runImage", () => {
     await mock.waitForCall({ index: 1 });
     const runCall = mock.callAt({ index: 1 });
 
-    assert.deepEqual(runCall.args, ["run", "-i", "sha256:abc123"]);
+    assert.deepEqual(withoutName({ args: runCall.args }), ["run", "--rm", "-i", "sha256:abc123"]);
 
     completeRun({ call: runCall, stdout: "hello", stderr: "oops" });
 
@@ -573,8 +755,8 @@ describe("createDockerBuildContext / runImage", () => {
     await mock.waitForCall({ index: 1 });
     const runCall = mock.callAt({ index: 1 });
 
-    assert.deepEqual(runCall.args, [
-      "run", "-i", "-e", "GREETING=hello", "-e", "OTHER=value", "sha256:feedface"
+    assert.deepEqual(withoutName({ args: runCall.args }), [
+      "run", "--rm", "-i", "-e", "GREETING=hello", "-e", "OTHER=value", "sha256:feedface"
     ]);
 
     completeRun({ call: runCall });
@@ -1084,6 +1266,466 @@ describe("createDockerBuildContext / raw log variants", () => {
 
     assert.equal(textOf({ events: collected, type: "build-log" }), "#1 building\n");
     assert.equal(textOf({ events: collected, type: "stdout" }), "ran");
+  });
+
+});
+
+// Destroying is the consumer saying "I am done with this, whatever it was doing". The
+// four blocks that follow walk through every stage a stream can be at when that happens,
+// and each test asserts the same two things: the destroy completes on its own, and
+// nothing docker was asked to do is still running afterwards.
+describe("createDockerBuildContext / destroy while building", () => {
+
+  it("should stop the build when destroyed before it produced anything", async () => {
+    const mock = createSpawnMock();
+    const context = createPassThrough();
+    const duplex = makeContext({
+      spawn: mock.spawn,
+      createContext: providing({ context })
+    }).runImage({ environment: {}, buildArgs: {} });
+
+    await destroyAndWaitForClose({ target: duplex });
+
+    assert.equal(mock.callCount(), 1, "no container may be started");
+    assert.equal(mock.callAt({ index: 0 }).proc.killCount(), 1, "the build must be killed");
+    assert.ok(context.destroyed, "the build context must be released");
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should stop the build when destroyed halfway through the build log", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    duplex.resume();
+
+    const buildCall = mock.callAt({ index: 0 });
+
+    buildCall.proc.stderr.write(`{"id":"step-1"}\n`);
+    await settle();
+
+    await destroyAndWaitForClose({ target: duplex });
+
+    assert.equal(mock.callCount(), 1, "no container may be started");
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should stop a build that is still being fed its context", async () => {
+    const mock = createSpawnMock();
+    const context = createPassThrough();
+    const duplex = makeContext({
+      spawn: mock.spawn,
+      createContext: providing({ context })
+    }).runImage({ environment: {}, buildArgs: {} });
+
+    // the context is still open, so docker is mid-transfer when the consumer walks away
+    context.write("half-a-tar");
+    await settle();
+
+    await destroyAndWaitForClose({ target: duplex });
+
+    assert.ok(context.destroyed, "the build context must be released");
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should remove the image id directory of a build it abandoned", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    const directory = imageIdDirectoryOf({ call: mock.callAt({ index: 0 }) });
+
+    assert.ok(fs.existsSync(directory), "the build must have made one");
+
+    await destroyAndWaitForClose({ target: duplex });
+
+    assert.ok(!fs.existsSync(directory), "the abandoned build must not leave it behind");
+    assertNothingLeftRunning({ mock });
+  });
+
+});
+
+// Once the build is over it is the container, and only the container, that has to go.
+describe("createDockerBuildContext / destroy while running", () => {
+
+  it("should kill a container that was started while the stream was being destroyed", async () => {
+    let duplex: stream.Duplex | undefined = undefined;
+
+    const mock = createSpawnMock({
+      onSpawn: ({ index }) => {
+        // the narrowest window there is: the consumer gives up while docker run is being
+        // created, before anything has had a chance to tie it to the stream
+        if (index === 1) {
+          duplex?.destroy();
+        }
+      }
+    });
+
+    duplex = makeContext({ spawn: mock.spawn }).runImage({ environment: {}, buildArgs: {} });
+    duplex.once("error", () => {
+      return undefined;
+    });
+    duplex.resume();
+
+    completeBuild({ call: mock.callAt({ index: 0 }) });
+
+    await mock.waitForCall({ index: 1 });
+    await settle();
+    await settle();
+
+    assert.equal(mock.callAt({ index: 1 }).proc.killCount(), 1, "the container must be killed");
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should stop the container when destroyed before it produced anything", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    duplex.resume();
+    completeBuild({ call: mock.callAt({ index: 0 }) });
+
+    await mock.waitForCall({ index: 1 });
+
+    await destroyAndWaitForClose({ target: duplex });
+
+    assert.equal(mock.callAt({ index: 1 }).proc.killCount(), 1, "the container must be killed");
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should stop the container when destroyed halfway through its output", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    duplex.resume();
+    completeBuild({ call: mock.callAt({ index: 0 }) });
+
+    await mock.waitForCall({ index: 1 });
+    const runCall = mock.callAt({ index: 1 });
+
+    runCall.proc.stdout.write("half-the-output");
+    await settle();
+
+    await destroyAndWaitForClose({ target: duplex });
+
+    assert.equal(runCall.proc.killCount(), 1, "the container must be killed");
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should stop the container when destroyed while nothing is reading", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    // deliberately no reader: everything from the build on is sitting in the buffers
+    completeBuild({ call: mock.callAt({ index: 0 }) });
+    await settle();
+
+    await destroyAndWaitForClose({ target: duplex });
+
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should stop the container when destroyed while stdin is still open", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    duplex.resume();
+    completeBuild({ call: mock.callAt({ index: 0 }) });
+
+    await mock.waitForCall({ index: 1 });
+
+    // the writable half is still being used when the consumer gives up
+    duplex.write({ type: "stdin", data: encoder.encode("still talking\n") });
+
+    await destroyAndWaitForClose({ target: duplex });
+
+    assert.equal(mock.callAt({ index: 1 }).proc.killCount(), 1, "the container must be killed");
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should remove the container by name, not just kill the client", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    duplex.resume();
+    completeBuild({ call: mock.callAt({ index: 0 }) });
+
+    await mock.waitForCall({ index: 1 });
+    const runCall = mock.callAt({ index: 1 });
+    const containerName = containerNameOf({ call: runCall });
+
+    assert.ok(containerName.startsWith("node-dockerfiler-"), containerName);
+
+    await destroyAndWaitForClose({ target: duplex });
+
+    // killing docker run leaves the container itself running, so it has to be named and
+    // removed; the client dying is not enough
+    await mock.waitForCall({ index: 2 });
+
+    assert.deepEqual(mock.callAt({ index: 2 }).args, ["rm", "--force", containerName]);
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should stop the container when destroyed with an error", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    duplex.resume();
+    completeBuild({ call: mock.callAt({ index: 0 }) });
+
+    await mock.waitForCall({ index: 1 });
+
+    const failed = new Promise<Error>((resolve) => {
+      duplex.once("error", resolve);
+    });
+
+    await destroyAndWaitForClose({ target: duplex, error: Error("the consumer gave up") });
+
+    assert.equal((await failed).message, "the consumer gave up");
+    assert.equal(mock.callAt({ index: 1 }).proc.killCount(), 1, "the container must be killed");
+    assertNothingLeftRunning({ mock });
+  });
+
+});
+
+// A destroy that arrives once everything has already stopped stays a no-op: no stray
+// signal, no second close, no throw.
+describe("createDockerBuildContext / destroy with nothing left to stop", () => {
+
+  it("should do nothing when destroyed after the run finished", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    const events = collectEvents<TRunOutputEvent>({ source: duplex });
+
+    completeBuild({ call: mock.callAt({ index: 0 }) });
+
+    await mock.waitForCall({ index: 1 });
+    const runCall = mock.callAt({ index: 1 });
+
+    completeRun({ call: runCall, stdout: "all done" });
+
+    assert.equal(textOf({ events: await events, type: "stdout" }), "all done");
+
+    // the container exited on its own, so there is nothing left to signal
+    await destroyAndWaitForClose({ target: duplex });
+
+    assert.equal(runCall.proc.killCount(), 0, "an exited container must not be signalled");
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should shrug off a cleanup command that cannot even be spawned", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    duplex.resume();
+    completeBuild({ call: mock.callAt({ index: 0 }) });
+
+    await mock.waitForCall({ index: 1 });
+    await destroyAndWaitForClose({ target: duplex });
+    await mock.waitForCall({ index: 2 });
+
+    // the stream is already gone, so a failing cleanup has nowhere to report to and must
+    // not become an uncaught exception either
+    mock.callAt({ index: 2 }).proc.emit("error", Error("docker rm: no such command"));
+
+    await settle();
+  });
+
+  it("should not remove a container that already stopped on its own", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    const events = collectEvents<TRunOutputEvent>({ source: duplex });
+
+    completeBuild({ call: mock.callAt({ index: 0 }) });
+
+    await mock.waitForCall({ index: 1 });
+    completeRun({ call: mock.callAt({ index: 1 }) });
+
+    await events;
+    await destroyAndWaitForClose({ target: duplex });
+
+    // --rm already took care of it, so there is nothing to clean up after
+    assert.equal(mock.callCount(), 2, "no cleanup command may be run");
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should do nothing when destroyed twice", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    duplex.resume();
+    completeBuild({ call: mock.callAt({ index: 0 }) });
+
+    await mock.waitForCall({ index: 1 });
+    const runCall = mock.callAt({ index: 1 });
+
+    await destroyAndWaitForClose({ target: duplex });
+    await destroyAndWaitForClose({ target: duplex });
+
+    assert.equal(runCall.proc.killCount(), 1, "the container must be signalled once");
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should do nothing when destroyed after the build already failed", async () => {
+    const mock = createSpawnMock();
+    const duplex = makeContext({ spawn: mock.spawn }).runImage({
+      environment: {},
+      buildArgs: {}
+    });
+
+    const events = collectEvents<TRunOutputEvent>({ source: duplex });
+    const buildCall = mock.callAt({ index: 0 });
+
+    buildCall.proc.stderr.end();
+    buildCall.proc.emit("close", 4);
+
+    const { error } = await rejectionOf({ promise: events });
+
+    assert.ok(error.message.includes("exited with code 4"), error.message);
+
+    await destroyAndWaitForClose({ target: duplex });
+
+    assert.equal(mock.callCount(), 1, "no container may be started");
+    assertNothingLeftRunning({ mock });
+  });
+
+});
+
+// The export stream has the same obligations, and neither it nor a run may be left
+// running by a polite signal alone if docker refuses to act on it.
+describe("createDockerBuildContext / destroy on an export, and stubborn processes", () => {
+
+  it("should stop the export when destroyed halfway through the tar payload", async () => {
+    const mock = createSpawnMock();
+    const context = createPassThrough();
+    const output = makeContext({
+      spawn: mock.spawn,
+      createContext: providing({ context })
+    }).exportImageAsTarStream({ buildArgs: {} });
+
+    output.resume();
+
+    const call = mock.callAt({ index: 0 });
+
+    call.proc.stderr.write(`{"id":"exporting"}\n`);
+    call.proc.stdout.write("half-a-tar");
+    await settle();
+
+    await destroyAndWaitForClose({ target: output });
+
+    assert.equal(call.proc.killCount(), 1, "docker must be killed");
+    assert.ok(context.destroyed, "the build context must be released");
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should do nothing when the export is destroyed after it finished", async () => {
+    const mock = createSpawnMock();
+    const output = makeContext({ spawn: mock.spawn }).exportImageAsTarStream({ buildArgs: {} });
+
+    const events = collectEvents<TExportEvent>({ source: output });
+    const call = mock.callAt({ index: 0 });
+
+    call.proc.stderr.end();
+    call.proc.stdout.end("TAR-BYTES");
+    call.proc.emit("close", 0);
+
+    assert.equal(textOf({ events: await events, type: "data" }), "TAR-BYTES");
+
+    await destroyAndWaitForClose({ target: output });
+
+    assert.equal(call.proc.killCount(), 0, "an exited process must not be signalled");
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should escalate to SIGKILL when docker ignores the polite signal", async () => {
+    const mock = createSpawnMock({ ignoresSigterm: true });
+    const output = makeContext({
+      spawn: mock.spawn,
+      killGracePeriodMs: 10
+    }).exportImageAsTarStream({ buildArgs: {} });
+
+    output.resume();
+
+    await destroyAndWaitForClose({ target: output });
+
+    const { proc } = mock.callAt({ index: 0 });
+
+    assert.deepEqual(proc.signalsSent(), ["SIGTERM"], "the polite signal comes first");
+
+    await waitUntil({
+      condition: () => {
+        return proc.hasExited();
+      }
+    });
+
+    assert.deepEqual(proc.signalsSent(), ["SIGTERM", "SIGKILL"]);
+    assertNothingLeftRunning({ mock });
+  });
+
+  it("should escalate on a container that ignores the polite signal", async () => {
+    const mock = createSpawnMock({ ignoresSigterm: true });
+    const duplex = makeContext({
+      spawn: mock.spawn,
+      killGracePeriodMs: 10
+    }).runImage({ environment: {}, buildArgs: {} });
+
+    duplex.resume();
+
+    // the build has to be allowed to finish, so it is the container that is left hanging
+    const buildCall = mock.callAt({ index: 0 });
+
+    writeImageId({ call: buildCall, imageId: "sha256:feedface" });
+    buildCall.proc.stderr.end();
+    buildCall.proc.emit("close", 0);
+
+    await mock.waitForCall({ index: 1 });
+    const runCall = mock.callAt({ index: 1 });
+
+    await destroyAndWaitForClose({ target: duplex });
+
+    await waitUntil({
+      condition: () => {
+        return runCall.proc.hasExited();
+      }
+    });
+
+    assert.deepEqual(runCall.proc.signalsSent(), ["SIGTERM", "SIGKILL"]);
+    assertNothingLeftRunning({ mock });
   });
 
 });
