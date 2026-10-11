@@ -3,10 +3,12 @@ import type stream from "stream";
 
 import {
   createDockerBuildContext,
-  createContextTarStreamFromDirectory
+  createContextTarStreamFromDirectory,
+  createContextTarStreamFromFiles
 } from "./build-context.ts";
 
 import type {
+  TContextFile,
   TSpawn,
   TBuildLogEvent,
   TBuildEvent,
@@ -46,11 +48,13 @@ export {
   createDefaultDockerBuildContext,
   createDockerBuildContext,
   createContextTarStreamFromDirectory,
+  createContextTarStreamFromFiles,
   buildStreamToTar,
   buildStreamToFileInTar
 };
 
 export type {
+  TContextFile,
   TSpawn,
   TBuildLogEvent,
   TBuildEvent,

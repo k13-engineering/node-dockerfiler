@@ -7,6 +7,7 @@ import { setTimeout, clearTimeout } from "node:timers";
 
 import tarFs from "tar-fs";
 import type { Options } from "tar-fs";
+import tarStream from "tar-stream";
 import type * as child_process from "node:child_process";
 // @ts-expect-error missing types
 import JSONStream from "JSONStream";
@@ -424,6 +425,66 @@ const createContextTarStreamFromDirectory = ({
   return pack as unknown as stream.Readable;
 };
 
+// A file the caller has already got in hand, rather than one to be read from a directory.
+// There is no owner and no timestamp: nothing was taken from a filesystem that could have
+// carried them, and leaving them out is what makes the context reproducible.
+type TContextFile = {
+  content: Uint8Array;
+  mode: bigint;
+};
+
+const contextFileEpoch = new Date(0);
+
+const createContextTarStreamFromFiles = ({
+  files,
+  dockerfileContent
+}: {
+  files: { [path: string]: TContextFile };
+  dockerfileContent: string;
+}) => {
+  const pack = tarStream.pack();
+
+  // written through the entry's own stream rather than handed over as one block, which
+  // keeps the content a Uint8Array. tar-stream only derives the size from a whole block,
+  // so it has to be stated here.
+  const addEntry = ({
+    name,
+    mode,
+    content
+  }: {
+    name: string;
+    mode: number;
+    content: Uint8Array;
+  }) => {
+    const entry = pack.entry({
+      name,
+      mode,
+      uid: 0,
+      gid: 0,
+      mtime: contextFileEpoch,
+      size: content.byteLength
+    });
+
+    entry.end(content);
+  };
+
+  Object.keys(files).forEach((name) => {
+    const file = files[name];
+
+    addEntry({ name, mode: Number(file.mode), content: file.content });
+  });
+
+  addEntry({
+    name: "Dockerfile",
+    mode: 0o644,
+    content: new TextEncoder().encode(dockerfileContent)
+  });
+
+  pack.finalize();
+
+  return pack as unknown as stream.Readable;
+};
+
 const createDockerBuildContext = ({
   createContextTarStream,
   platform,
@@ -751,10 +812,12 @@ const createDockerBuildContext = ({
 
 export {
   createDockerBuildContext,
-  createContextTarStreamFromDirectory
+  createContextTarStreamFromDirectory,
+  createContextTarStreamFromFiles
 };
 
 export type {
+  TContextFile,
   TSpawn,
   TBuildLogEvent,
   TBuildEvent,
