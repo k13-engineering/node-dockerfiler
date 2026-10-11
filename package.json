@@ -3,11 +3,7 @@
   "type": "module",
   "version": "0.0.4",
   "description": "Node.js library to run Dockerfiles easily",
-  "main": "lib/index.js",
-  "scripts": {
-    "test": "c8 --reporter lcov --reporter html --reporter text --all mocha",
-    "eslint": "eslint ."
-  },
+  "main": "lib/index.ts",
   "repository": {
     "type": "git",
     "url": "git+https://github.com/k13-engineering/node-dockerfiler.git"
@@ -23,13 +19,30 @@
     "url": "https://github.com/k13-engineering/node-dockerfiler/issues"
   },
   "homepage": "https://github.com/k13-engineering/node-dockerfiler#readme",
+  "scripts": {
+    "build": "rm -rf dist/ && deno-node-build --root . --out dist/ --entry lib/index.ts",
+    "type-check": "tsc --noEmit",
+    "test": "c8 --reporter lcov --reporter html --reporter text --all --include lib/ --exclude lib/**/*.spec.ts mocha lib/**/*.spec.ts",
+    "lint": "eslint .",
+    "update-deps": "npm-check-updates -u"
+  },
   "dependencies": {
-    "dockerode": "^4.0.9",
-    "tar-fs": "^3.1.1"
+    "JSONStream": "^1.3.5",
+    "tar-fs": "^3.0.6",
+    "tar-stream": "^3.2.1"
   },
   "devDependencies": {
-    "c8": "^10.1.3",
-    "eslint": "^9.39.2",
-    "mocha": "^11.7.5"
+    "@eslint/js": "^10.0.1",
+    "@k13engineering/eslint-rules": "^0.0.6",
+    "@k13engineering/releasetool": "^0.0.5",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "^25.6.0",
+    "@types/tar-fs": "^2.0.4",
+    "@types/tar-stream": "^3.1.4",
+    "c8": "^11.0.0",
+    "deno-node": "^0.0.12",
+    "mocha": "^10.2.0",
+    "npm-check-updates": "^20.0.2",
+    "typescript": "^6.0.3"
   }
 }
